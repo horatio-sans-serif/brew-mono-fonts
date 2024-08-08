@@ -1,0 +1,320 @@
+#!/bin/bash
+
+set -e
+
+# Check that we have Homebrew installed
+
+if ! command brew --version >/dev/null 2>&1; then
+    echo "Please install Homebrew first"
+    exit 1
+fi
+
+if [[ -z "$HOMEBREW_PREFIX" ]]; then
+    HOMEBREW_PREFIX=$(brew --prefix)
+fi
+
+# Check that we have ImageMagick installed
+
+if ! command -v magick >/dev/null 2>&1; then
+    echo -n "ImageMagick not installed -- install it? (y/n) "
+    read -r answer
+    if [[ "$answer" == "y" ]]; then
+        brew install imagemagick
+    fi
+    if ! command -v imagemagick >/dev/null 2>&1; then
+        echo "ImageMagick not installed"
+        exit 1
+    fi
+fi
+
+# Check that we have ripgrep installed
+
+if ! command rg --version >/dev/null 2>&1; then
+    echo -n "ripgrep not installed -- install it? (y/n) "
+    read -r answer
+    if [[ "$answer" == "y" ]]; then
+        brew install ripgrep
+    fi
+    if ! command rg >/dev/null 2>&1; then
+        echo "ripgrep not installed"
+        exit 1
+    fi
+fi
+
+# Check that we have fd installed
+
+if ! command fd --version >/dev/null 2>&1; then
+    echo -n "fd not installed -- install it? (y/n) "
+    read -r answer
+    if [[ "$answer" == "y" ]]; then
+        brew install fd
+    fi
+    if ! command fd >/dev/null 2>&1; then
+        echo "fd not installed"
+        exit 1
+    fi
+fi
+
+# Which mono fonts are already installed?
+
+installed=$(brew list --casks | xargs printf "%s\n" | rg --color=never 'font.+mono' | sort)
+
+# Which mono fonts are available to be installed?
+
+avail=$(brew search /font-.+-mono/ | xargs printf "%s\n" | sort)
+
+# Find which are missing between available and installed.
+#
+# -1 means suppress what's already installed
+# -3 means suppress what's available but already installed (common to both)
+# Thus, only what's not already installed remains.
+
+missing=$(comm -13 <(echo "$installed") <(echo "$avail"))
+
+n_installed=0
+
+if [ -z "$missing" ]; then
+    to_preview="$avail"
+else
+    # There are sometimes problems with brew font packages where there are variations of
+    # a font that install the *same font file* so you are somehow supposed to know this
+    # a priori.
+    #
+    # E.g.
+    #     Installing font-fantasque-sans-mono-noloopk ...
+    #     ==> Downloading https://github.com/belluzj/fantasque-sans/releases/download/v1.8.0/FantasqueSansMono-NoLoopK.zip
+    #     ==> Installing Cask font-fantasque-sans-mono-noloopk
+    #     Error: It seems there is already a Font at '/Users/XYZ/Library/Fonts/FantasqueSansMono-Bold.otf'.
+
+    to_preview="$missing"
+
+    ERROR_LOG=/tmp/.brew-mono-fonts-preview-error.log
+    rm -f "$ERROR_LOG"
+
+    set +e
+
+    for pkg in $missing; do
+        echo "Installing $pkg ..."
+        if brew install --cask "$pkg" >>"$ERROR_LOG" 2>&1; then
+            n_installed=$((n_installed + 1))
+        else
+            echo "Failed to install $pkg"
+            echo "See $ERROR_LOG for details"
+            to_preview="${to_preview//$pkg/}"
+        fi
+    done
+
+    set -e
+
+fi
+
+if [ "$n_installed" -eq 0 ]; then
+    echo -n "No fonts were installed. Would you like to create a preview of all already-installed monospaced fonts? (y/n) "
+    read -r answer
+
+    if [[ "$answer" == "y" ]]; then
+        to_preview="$installed"
+    else
+        exit 0
+    fi
+fi
+
+# For each missing font, create a preview image
+
+FONT_IMAGES=${FONT_IMAGES:-"/tmp/.brew-mono-fonts-preview-images"}
+rm -rf "${FONT_IMAGES:?}"
+mkdir -p "$FONT_IMAGES"
+
+FG_COLOR=${FG_COLOR:-black}
+BG_COLOR=${BG_COLOR:-none}
+WIDTH=${WIDTH:-1024}
+POINTSIZE=${POINTSIZE:-20}
+
+n_previews_created=0
+
+for pkg in $to_preview; do
+    printf "Creating preview image %s\n" "$pkg"
+
+    # Find all the font files in the package.
+
+    pkg_fonts=()
+
+    while IFS= read -r line; do
+        pkg_fonts+=("$line")
+    done < <(fd -e ttf -e otf . "$HOMEBREW_PREFIX/Caskroom/$pkg" 2>/dev/null)
+
+    if [ ${#pkg_fonts[@]} -eq 0 ]; then
+        echo "WARNING: No fonts found for package $pkg -- skipping"
+        continue
+    fi
+
+    mkdir -p "$FONT_IMAGES/$pkg"
+
+    for font_path in "${pkg_fonts[@]}"; do
+        preview_path="$FONT_IMAGES/$pkg/$(basename "$font_path" | tr ' ' '-').png"
+
+        printf "\r\033[K"
+        printf "%s" "$(basename "$font_path")"
+
+        magick \
+            -background none \
+            -fill "$FG_COLOR" \
+            -font "$font_path" \
+            -size "$WIDTH"x \
+            -pointsize "$POINTSIZE" \
+            label:"\!\@\#\$\%\^\&\*\(\)\{\}\[\]\:\;\<\>\,\.\;\'\:\"\/\?\~  ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz 0123456789" \
+            "$preview_path"
+    done
+
+    printf "\r\033[K"
+
+    # Create a montage image from the images of each font variant in the package.
+
+    pkg_images=()
+
+    while IFS= read -r line; do
+        pkg_images+=("$line")
+    done < <(fd -e png . "$FONT_IMAGES/$pkg")
+
+    if [ ${#pkg_images[@]} -eq 0 ]; then
+        echo "No PNG images found for package $pkg"
+        exit 1
+    fi
+
+    magick montage \
+        -background none \
+        -mode concatenate \
+        -tile 1x \
+        -set label "%t" \
+        -geometry +0+10 \
+        "${pkg_images[@]}" \
+        "$FONT_IMAGES/$pkg.png"
+
+    # Delete the font variant images now that we have the montage.
+
+    rm -rf "${FONT_IMAGES:?}/$pkg"
+
+    n_previews_created=$((n_previews_created + 1))
+done
+
+if [ "$n_previews_created" -eq 0 ]; then
+    echo "No fonts to preview so we are done here."
+    exit 1
+fi
+
+echo "Creating preview HTML UI..."
+
+OUT="/tmp/.brew-mono-fonts-preview.html"
+
+cat >"$OUT" <<EOF
+<!DOCTYPE html>
+<html lang=en>
+<head>
+  <meta charset=UTF-8>
+  <title>Homebrew Monospace Fonts Previewer</title>
+  <style>
+  body {
+    font-family: sans-serif;
+    font-size: ${POINTSIZE}px;
+    background-color: $BG_COLOR;
+    color: $FG_COLOR;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2rem;
+    padding: 1rem;
+    margin: 0;
+  }
+  label {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 1rem;
+  }
+  section.font {
+    display: flex;
+    flex-direction: column;
+    padding: 1rem;
+    border: 1px solid #ccc;
+    border-radius: 0.5rem;
+    box-shadow: 0 0.25rem 0.5rem rgba(0, 0, 0, 0.5);
+    gap: 1rem;
+  }
+  input[type=checkbox] {
+    width: 2rem;
+    height: 2rem;
+  }
+  textarea {
+    width: 100%;
+    background: transparent;
+    border: none;
+  }
+  button {
+    background: tomato;
+    color: white;
+    padding: 0.5rem;
+    border-radius: 0.5rem;
+    border: none;
+    font-weight: bold;
+    cursor: pointer;
+  }
+  .font-name {
+    font-size: 1.5rem;
+  }
+  </style>
+</head>
+<body>
+  <h1>Homebrew Monospace Fonts Previewer</h1>
+  <ul>
+    <li>The following monospace fonts are installed.
+    <li>Select the fonts you would like to remove.
+    <li>Then click on "Copy to Clipboard".
+    <li>In your terminal, paste the copied brew command.
+  </ul>
+  <h2>Final brew command to remove selected fonts</h2>
+  <textarea id=brew-command rows=5 readonly></textarea>
+  <button onclick="copyToClipboard()">Copy to Clipboard</button>
+  <span id=copy-status></span>
+  <script>
+function copyToClipboard() {
+  const cmd = document.getElementById('brew-command').value;
+  navigator.clipboard.writeText(cmd).then(() => {
+    document.getElementById('copy-status').textContent = 'Copied!';
+    setTimeout(() => {
+      document.getElementById('copy-status').textContent = '';
+    }, 2000);
+  });
+}
+function toggle_font(checkbox) {
+  window.marked_pkgs = window.marked_pkgs || [];
+  if (checkbox.checked) window.marked_pkgs.push(checkbox.value);
+  else window.marked_pkgs = window.marked_pkgs.filter(pkg => pkg !== checkbox.value);
+  document.getElementById('brew-command').value = (window.marked_pkgs.length > 0)
+    ? \`brew uninstall --cask \${window.marked_pkgs.join(' ')}\`
+    : ''
+}
+  </script>
+  <h2>Font Previews</h2>
+EOF
+
+for img in "$FONT_IMAGES"/*.png; do
+    pkg_name=$(basename "$img" .png)
+    cat <<EOF >>"$OUT"
+<section class=font>
+  <div class=font-name>$pkg_name</div>
+  <label><input type=checkbox name=fonts value=$pkg_name onchange='toggle_font(this)' /> Remove Font</label>
+  <img src=$img />
+</section>
+EOF
+done
+
+cat <<EOF >>"$OUT"
+</body>
+</html>
+EOF
+
+printf "\tLaunching UI at: %s\n" "$OUT"
+open "$OUT"
+
+printf "Done. Use the UI to create a command to remove the fonts you do not want and paste it here afterwards.\n"
